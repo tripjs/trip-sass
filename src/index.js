@@ -1,4 +1,5 @@
 import _ from 'lodash';
+import CodeError from 'code-error';
 import LazyBuilder from 'lazy-builder';
 import micromatch from 'micromatch';
 import path from 'path';
@@ -8,12 +9,11 @@ import sass from 'node-sass';
 import subdir from 'subdir';
 
 let render;
-const scssExt = /\.scss$/;
-// const hasSassExtension = /\.s[ca]ss$/;
+const eitherExtension = /\.s[ca]ss$/;
 
 const defaults = {
   sourceMap: true,
-  include: '**/*.scss',
+  include: '**/*.{sass,scss}',
 };
 
 const permittedOptions = [
@@ -22,8 +22,9 @@ const permittedOptions = [
 ];
 
 export default function (options) {
+  let sassOptions, base;
+
   options = Object.assign({}, defaults, options);
-  let sassOptions;
 
   const included = micromatch.filter(options.include);
 
@@ -41,8 +42,9 @@ export default function (options) {
     options.loadPaths = options.loadPaths.map(loadPath => path.resolve(loadPath));
   }
 
-  // return the build function
-  return new LazyBuilder(function *tripSass(file, contents) {
+
+  // make a reusable lazy builder
+  const builder = new LazyBuilder(function *tripSass(file, contents) {
     // skip irrelevant files
     if (!included(file)) return contents;
 
@@ -50,21 +52,20 @@ export default function (options) {
     if (path.basename(file).charAt(0) === '_') return null;
 
     // establish the output filename
-    const outputFile = file.replace(scssExt, '') + '.css';
+    const outputFile = file.replace(eitherExtension, '') + '.css';
 
     // exit fast with a blank CSS file if the source SCSS file is blank
     // (necessitated by https://github.com/sass/node-sass/issues/924)
     const source = contents.toString();
     if (!source) return {[outputFile]: ''};
 
-    // make a fake base for our relative files, just so everything's absolute, for simplicity
-    const fakeBase = process.platform === 'win32' ? 'X:\\__TRIP_SASS__' : '/__TRIP_SASS__';
-    const fakeEntryFile = path.resolve(fakeBase, file);
+    // for simplicity, deal with absolute pathnames while processing as Sass
+    const absoluteEntryFile = path.resolve(base, file);
 
     // keep memos of how imports get resolved, in case we need this info to
     // report an error that originated from a partial :/
     const rememberedImportContents = {};
-    const resolvedImportPaths = {stdin: fakeEntryFile};
+    // const resolvedImportPaths = {stdin: absoluteEntryFile};
 
     const builder = this;
 
@@ -73,13 +74,11 @@ export default function (options) {
       data: source,
 
       importer: (arg, prev, done) => {
-        // Resolve the import `arg`, load the contents (either locally or from a load path), and call the callback with it.
-        // e.g. done({contents: result.contents.toString(), file: result.file});
-        // or done(new Error(`trip-sass: Could not import "${url}" from ${path.dirname(importingFile)}`));
+        // Resolve the import `arg`, load the contents (either locally or from a load path), and call the callback with {file, contents} or an error. NB contents must be a string.
 
         Promise.coroutine(function *() {
           // establish which file the @import statement was encoutnered in
-          const importer = (prev === 'stdin' ? fakeEntryFile : prev);
+          const importer = (prev === 'stdin' ? absoluteEntryFile : prev);
           console.assert(path.isAbsolute(importer), 'importing file should be absolute at this point');
 
           // establish where we're looking...
@@ -94,13 +93,12 @@ export default function (options) {
           for (const loadPath of loadPaths) {
             // establish facts about the way it's been requested
             const hasUnderscore = argBasename.charAt(0) === '_';
-            const hasSassExt = arg.endsWith('.sass');
-            const hasScssExt = arg.endsWith('.scss');
+            const hasExtension = eitherExtension.test(arg);
 
             // make a list of candidates
             const candidates = [];
             if (!hasUnderscore) {
-              if (hasSassExt || hasScssExt) candidates.push(path.join(argDirname, `_${argBasename}`), arg);
+              if (hasExtension) candidates.push(path.join(argDirname, `_${argBasename}`), arg);
               else {
                 candidates.push(
                   path.join(argDirname, `_${argBasename}.scss`),
@@ -110,18 +108,16 @@ export default function (options) {
                 );
               }
             }
-            else if (hasSassExt || hasScssExt) candidates.push(arg);
+            else if (hasExtension) candidates.push(arg);
             else candidates.push(`${arg}.scss`, `${arg}.sass`);
 
             // convert to full paths and filter out those that don't exist
             const existingCandidates = yield Promise.map(candidates, candidate => {
               candidate = path.resolve(loadPath, candidate);
 
-              // try to import it, either with this.importFile (if it's inside the imaginaryBase) or using a load path.
-              // and return the {file, contents}
-              // try to import it as an internal import if it's inside the fakeBase
-              if (subdir(fakeBase, candidate)) {
-                const contents = builder.importFile(path.relative(fakeBase, candidate));
+              // try to import it, either with this.importFile if it's inside the base, otherwise straight from disk
+              if (subdir(base, candidate)) {
+                const contents = builder.importFile(path.relative(base, candidate));
                 if (contents) return {contents: contents.toString(), file: candidate};
                 return false;
               }
@@ -162,7 +158,7 @@ export default function (options) {
         })()
           .then(result => {
             // add it to the memos in case of errors loading a deeper import
-            resolvedImportPaths[arg] = result.file;
+            // resolvedImportPaths[arg] = result.file;
             rememberedImportContents[result.file] = result.contents;
 
             done(result);
@@ -193,22 +189,26 @@ export default function (options) {
       };
     }
     catch (error) {
-      throw error; // TODO use CodeError (commented section below)
-
-      // // establish the real file path where the error occurred
+      // establish the real file path where the error occurred
       // let realErrorFile = resolvedImportPaths[error.file];
       // if (realErrorFile) {
-      //   if (subdir(fakeBase, error.file)) realErrorFile = path.relative(fakeBase, error.file);
+      //   if (subdir(base, error.file)) realErrorFile = path.relative(base, error.file);
       // }
       // else realErrorFile = `unknown(${error.file})`;
 
-      // throw new CodeError({
-      //   message: error.message.split('\n')[0],
-      //   path: realErrorFile,
-      //   contents: (error.file === 'stdin' ? source : rememberedImportContents[error.file]),
-      //   line: error.line,
-      //   column: error.column,
-      // });
+      throw new CodeError(error.message.split('\n')[0], {
+        file: error.file === 'stdin' ? absoluteEntryFile : error.file,
+        contents: error.file === 'stdin' ? source : rememberedImportContents[error.file],
+        line: error.line,
+        column: error.column,
+      });
     }
-  }).build;
+  });
+
+  // return the build function
+  return function tripSass(files) {
+    if (!base) base = this.src;
+
+    return builder.build(files);
+  };
 }
