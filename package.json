@@ -1,7 +1,7 @@
 {
   "name": "trip-sass",
   "description": "Compiles Sass to CSS",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "author": "Callum Locke",
   "babel": {
     "presets": [
